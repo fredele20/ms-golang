@@ -3,7 +3,8 @@ package mongod
 import (
 	"context"
 	"errors"
-	"os"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/fredele20/microservice-practice/ms.users/db"
@@ -14,44 +15,55 @@ import (
 )
 
 type dbStore struct {
-	// client         *mongo.Client
+	client         *mongo.Client
 	dbName         string
-	collectionName string
 }
 
-var client *mongo.Client = db.DBInstance()
+func MongoConnection(connectionUri, databaseName string) (db.UserStore, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
 
-var dbName = os.Getenv("DATABASE_NAME")
+	client, err := mongo.NewClient(options.Client().ApplyURI(connectionUri))
+	if err != nil {
+		log.Fatal(err)
+	}
 
-func UserCollection() *mongo.Collection {
-	return client.Database(dbName).Collection("users")
+	err = client.Connect(ctx)
+
+	fmt.Println("connected to mongodb successfully....")
+
+	return &dbStore{client: client, dbName: databaseName}, nil
 }
 
-func SessionCollection() *mongo.Collection {
-	return client.Database(dbName).Collection("session")
+func (u dbStore) userCollection() *mongo.Collection {
+	return u.client.Database(u.dbName).Collection("users")
 }
 
-func GetUserByField(ctx context.Context, field, value string) (*models.User, error) {
+func (u dbStore) SessionCollection() *mongo.Collection {
+	return u.client.Database(u.dbName).Collection("session")
+}
+
+func (u dbStore) GetUserByField(ctx context.Context, field, value string) (*models.User, error) {
 	var user models.User
-	if err := UserCollection().FindOne(ctx, bson.M{field: value}).Decode(&user); err != nil {
+	if err := u.userCollection().FindOne(ctx, bson.M{field: value}).Decode(&user); err != nil {
 		return nil, err
 	}
 	return &user, nil
 }
 
-func GetUserByPhone(ctx context.Context, phone string) (*models.User, error) {
-	return GetUserByField(ctx, "phone", phone)
+func (u dbStore) GetUserByPhone(ctx context.Context, phone string) (*models.User, error) {
+	return u.GetUserByField(ctx, "phone", phone)
 }
 
-func GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
-	return GetUserByField(ctx, "email", email)
+func (u dbStore) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	return u.GetUserByField(ctx, "email", email)
 }
 
-func GetUserById(ctx context.Context, id string) (*models.User, error) {
-	return GetUserByField(ctx, "userid", id)
+func (u dbStore) GetUserById(ctx context.Context, id string) (*models.User, error) {
+	return u.GetUserByField(ctx, "userid", id)
 }
 
-func ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.UserList, error) {
+func (u dbStore) ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.UserList, error) {
 	opts := options.Find()
 	opts.SetProjection(bson.M{
 		"password": false,
@@ -70,7 +82,7 @@ func ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.User
 
 	var users []*models.User
 
-	cursor, err := UserCollection().Find(ctx, filter, opts)
+	cursor, err := u.userCollection().Find(ctx, filter, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +94,7 @@ func ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.User
 
 	delete(filter, "id")
 
-	count, err := UserCollection().CountDocuments(ctx, filter)
+	count, err := u.userCollection().CountDocuments(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -94,11 +106,11 @@ func ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.User
 
 }
 
-func UpdateUser(ctx context.Context, payload *models.User) (*models.User, error) {
+func (u dbStore) UpdateUser(ctx context.Context, payload *models.User) (*models.User, error) {
 	updatedAt, _ := time.Parse(time.RFC3339, time.Now().Format(time.RFC3339))
 	payload.UpdatedAt = updatedAt
 	var user models.User
-	if err := UserCollection().FindOneAndUpdate(ctx, bson.M{"userid": payload.UserId}, bson.M{
+	if err := u.userCollection().FindOneAndUpdate(ctx, bson.M{"userid": payload.UserId}, bson.M{
 		"$set": payload,
 	}, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&user); err != nil {
 		return nil, err
@@ -107,27 +119,27 @@ func UpdateUser(ctx context.Context, payload *models.User) (*models.User, error)
 	return &user, nil
 }
 
-func DeactivateUser(ctx context.Context, id string) (*models.User, error) {
-	return UpdateUser(ctx, &models.User{UserId: id, Status: models.StatusDeactivated})
+func (u dbStore) DeactivateUser(ctx context.Context, id string) (*models.User, error) {
+	return u.UpdateUser(ctx, &models.User{UserId: id, Status: models.StatusDeactivated})
 }
 
-func ActivateUser(ctx context.Context, id string) (*models.User, error) {
-	return UpdateUser(ctx, &models.User{UserId: id, Status: models.StatusActivated})
+func (u dbStore) ActivateUser(ctx context.Context, id string) (*models.User, error) {
+	return u.UpdateUser(ctx, &models.User{UserId: id, Status: models.StatusActivated})
 }
 
-func ResetPassword(ctx context.Context, id, password string) (*models.User, error) {
-	return UpdateUser(ctx, &models.User{UserId: id, Password: password})
+func (u dbStore) ResetPassword(ctx context.Context, id, password string) (*models.User, error) {
+	return u.UpdateUser(ctx, &models.User{UserId: id, Password: password})
 }
 
-func DeleteUser(ctx context.Context, id string) error {
-	if _, err := UserCollection().DeleteOne(ctx, bson.M{"userId": id}); err != nil {
+func (u dbStore) DeleteUser(ctx context.Context, id string) error {
+	if _, err := u.userCollection().DeleteOne(ctx, bson.M{"userId": id}); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func CreateUser(ctx context.Context, payload *models.User) (*models.User, error) {
+func (u dbStore) CreateUser(ctx context.Context, payload *models.User) (*models.User, error) {
 	filters := bson.M{
 		"$or": []bson.M{
 			{
@@ -141,11 +153,11 @@ func CreateUser(ctx context.Context, payload *models.User) (*models.User, error)
 
 	var user models.User
 
-	if err := UserCollection().FindOne(ctx, filters).Decode(&user); err == nil {
+	if err := u.userCollection().FindOne(ctx, filters).Decode(&user); err == nil {
 		return nil, ErrDuplicate
 	}
 
-	if _, err := UserCollection().InsertOne(ctx, payload); err != nil {
+	if _, err := u.userCollection().InsertOne(ctx, payload); err != nil {
 		return nil, err
 	}
 

@@ -5,17 +5,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func UserRoutes(incomingRoutes *gin.Engine) {
-	// incomingRoutes.Use(middleware.Authenticate())
-	incomingRoutes.GET("/users", routes.ListUsers())
-	// incomingRoutes.GET("/users")
-	incomingRoutes.GET("/users/:user_id", routes.GetUserById())
+type UserHandler struct {
+	routes *routes.UserRoutes
 }
 
-func AuthRoutes(incomingRoutes *gin.Engine) {
-	incomingRoutes.POST("users/signup", routes.Signup())
-	incomingRoutes.POST("users/login", routes.Login())
-	incomingRoutes.DELETE("users/logout", routes.Logout())
-	incomingRoutes.POST("users/forgot-password", routes.ForgotPassword())
-	incomingRoutes.POST("users/reset-password", routes.ResetPassword())
+func NewUserHandler(routes *routes.UserRoutes) *UserHandler {
+	return &UserHandler{
+		routes: routes,
+	}
+}
+
+func UserRoutes(incomingRoutes *gin.Engine, u UserHandler) {
+	// incomingRoutes.Use(middleware.Authenticate())
+	incomingRoutes.GET("/users", u.routes.ListUsers())
+	// incomingRoutes.GET("/users")
+	// incomingRoutes.GET("/users/:user_id", routes.GetUserById())
+}
+
+func AuthRoutes(incomingRoutes *gin.Engine, u UserHandler) {
+	incomingRoutes.POST("users/signup", u.routes.Signup())
+	incomingRoutes.POST("users/login", u.routes.Login())
+	incomingRoutes.DELETE("users/logout", u.routes.Logout())
+	incomingRoutes.POST("users/forgot-password", u.routes.ForgotPassword())
+	incomingRoutes.POST("users/reset-password", u.routes.ResetPassword())
 }

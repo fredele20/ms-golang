@@ -2,15 +2,19 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/fredele20/microservice-practice/ms.users/cache"
+	"github.com/fredele20/microservice-practice/ms.users/db"
 	"github.com/fredele20/microservice-practice/ms.users/db/mongod"
 	"github.com/fredele20/microservice-practice/ms.users/libs/session"
 	"github.com/fredele20/microservice-practice/ms.users/models"
 	"github.com/fredele20/microservice-practice/ms.users/utils"
+	"github.com/go-redis/redis/v8"
 	"github.com/nyaruka/phonenumbers"
 	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -35,9 +39,43 @@ var (
 	ErrFailedToResetPasswordBadToken = errors.New("Sorry, your reset token has expired. Please try requesting for password reset again.")
 	ErrPasswordIsSame                = errors.New("You cannot use this password, please login")
 	ErrPasswordDoesNotMatch          = errors.New("Password does not match, please try again")
-
-	ErrEmailDoesNotExist = errors.New("Email address does not exist")
+	ErrEmailDoesNotExist             = errors.New("Email address does not exist")
 )
+
+type UserService struct {
+	session session.SessionManager
+	db      db.UserStore
+	logger *logrus.Logger
+	redis cache.RedisStore
+}
+
+func NewUserService(redis cache.RedisStore, db db.UserStore, session session.SessionManager, logger *logrus.Logger) *UserService {
+	return &UserService{
+		session: session,
+		redis:   redis,
+		db:      db,
+		logger: logger,
+	}
+}
+
+type RequestMonitor struct {
+	Count int64
+	Error Error
+	Time  time.Duration
+}
+
+type Error string
+
+const (
+	ErrorMaximumRequest Error = "Too many load on server, please try again later"
+	ErrorMaximumTrial   Error = "Maximum number of trial reached"
+)
+
+// func (e *RequestMonitor) MaximumRequest(count int64, time time.Duration) error {
+
+// 	e.Count = 100
+
+// }
 
 func parsePhone(phone, iso2 string) (string, error) {
 	num, err := phonenumbers.Parse(phone, iso2)
@@ -57,7 +95,7 @@ func buildPictureURLFromName(name string) string {
 	return fmt.Sprintf("https://ui-avatars.com/api/?name=%s", strings.ReplaceAll(name, " ", "+"))
 }
 
-func CreateUser(ctx context.Context, payload models.User) (*models.User, error) {
+func (u *UserService) CreateUser(ctx context.Context, payload models.User) (*models.User, error) {
 	if err := payload.Validate(); err != nil {
 		logrus.WithError(err).Error(ErrUserValidationFailed.Error())
 		return nil, err
@@ -84,7 +122,7 @@ func CreateUser(ctx context.Context, payload models.User) (*models.User, error) 
 	payload.ID = primitive.NewObjectID()
 	payload.UserId = payload.ID.Hex()
 
-	user, err := mongod.CreateUser(ctx, &payload)
+	user, err := u.db.CreateUser(ctx, &payload)
 	if err != nil {
 		fmt.Println(err.Error())
 		if err == mongod.ErrDuplicate {
@@ -112,8 +150,8 @@ func CreateUser(ctx context.Context, payload models.User) (*models.User, error) 
 	return user, nil
 }
 
-func Login(ctx context.Context, email, password string) (*models.User, error) {
-	user, err := mongod.GetUserByEmail(ctx, email)
+func (u *UserService) Login(ctx context.Context, email, password string) (*models.User, error) {
+	user, err := u.db.GetUserByEmail(ctx, email)
 	if err != nil {
 		logrus.WithError(err).Error("failed to get user by email")
 		return nil, ErrAuthenticationFailed
@@ -125,7 +163,7 @@ func Login(ctx context.Context, email, password string) (*models.User, error) {
 		return nil, ErrAuthenticationFailed
 	}
 
-	token, err := session.CreateSession(session.Session{
+	session, err := u.session.CreateSession(ctx, "token", time.Hour * 1, session.Session{
 		UserId:         user.UserId,
 		Email:          user.Email,
 		FirstName:      user.FirstName,
@@ -135,15 +173,20 @@ func Login(ctx context.Context, email, password string) (*models.User, error) {
 		UnitOfValidity: session.UnitOfValidityHour,
 	})
 
-	user.Token = &token
+	if err != nil {
+		u.logger.WithError(err).Error("failed to create token for authenticated user")
+		return nil, err
+	}
 
-	fmt.Println(user)
+	user.Token = &session
 
 	return user, nil
 }
 
-func Logout(token string) error {
-	err := session.DestroySession(token)
+func (u *UserService) Logout(token string) error {
+	var ctx context.Context
+	err := u.redis.Del(ctx, token)
+	// err := session.DestroySession(token)
 	if err != nil {
 		logrus.WithError(err).Error("failed to destroy user logged in token")
 		return err
@@ -151,20 +194,21 @@ func Logout(token string) error {
 	return nil
 }
 
-func ForgotPassword(ctx context.Context, email string) (*models.User, error) {
-	user, err := mongod.GetUserByEmail(ctx, email)
+func (u *UserService) ForgotPassword(ctx context.Context, email string) (*models.User, error) {
+	user, err := u.db.GetUserByEmail(ctx, email)
 	if err != nil {
 		logrus.WithError(err).Error("failed to get user by email for password reset request")
 		return nil, ErrFailedToGetUserByEmail
 	}
 
-	token, err := session.CreateSession(session.Session{
+	token, err := u.session.CreateSession(ctx, "token", time.Hour * 1, session.Session{
 		UserId:         user.UserId,
 		Email:          user.Email,
 		FirstName:      user.FirstName,
 		LastName:       user.LastName,
-		Validity:       15,
-		UnitOfValidity: session.UnitOfValidityMinute,
+		Role:           user.UserType,
+		Validity:       1,
+		UnitOfValidity: session.UnitOfValidityHour,
 	})
 
 	if err != nil {
@@ -177,29 +221,67 @@ func ForgotPassword(ctx context.Context, email string) (*models.User, error) {
 	return user, nil
 }
 
-func ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.UserList, error) {
-	users, err := mongod.ListUsers(ctx, filters)
-	if err != nil {
-		logrus.WithError(err).Error(ErrListUsersFailed.Error())
+func (u UserService) ListUsers(ctx context.Context, filters models.ListUserFilter) (*models.UserList, error) {
+	var users models.UserList
+
+	cacheValue, err := u.redis.Get(ctx, "users")
+	if err == redis.Nil {
+		users, err := u.db.ListUsers(ctx, filters)
+		if err != nil {
+			logrus.WithError(err).Error(ErrListUsersFailed.Error())
+			return nil, err
+		}
+
+		cacheByte, err := json.Marshal(users)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = u.redis.Set(ctx, "users", cacheByte, time.Second*30)
+		if err != nil {
+			return nil, err
+		}
+
+		users.DataSource = models.Database
+		return users, nil
+	} else if err != nil {
 		return nil, err
+	} else {
+
+		err = json.Unmarshal(cacheValue, &users)
+		if err != nil {
+			return nil, err
+		}
+
+		users.DataSource = models.RedisStore
+		return &users, nil
 	}
 
-	return users, nil
 }
 
-func ResetPassword(ctx context.Context, token, password, confirmPassword string) (*models.User, error) {
+func (u UserService) ResetPassword(ctx context.Context, password, confirmPassword string) (*models.User, error) {
+	result, err := u.redis.Get(ctx, "token")
+	if err != nil {
+		return nil, err
+	}
+	var token string
+
+	fmt.Println(string(result))
 	if password != confirmPassword {
 		logrus.WithError(ErrPasswordDoesNotMatch).Error(ErrPasswordDoesNotMatch)
 		return nil, ErrPasswordDoesNotMatch
 	}
+	
+	_ = json.Unmarshal(result, &token)
+	fmt.Println("token: ",token)
 
-	userSession, err := session.GetSessionByToken(token)
+	userSession, err := u.session.GetSessionByToken(token)
 	if err != nil {
 		logrus.WithError(err).Error("failed to valid session")
 		return nil, ErrFailedToResetPasswordBadToken
 	}
 
-	user, err := mongod.GetUserById(ctx, userSession.UserId)
+	user, err := u.db.GetUserById(ctx, userSession.UserId)
 	if err != nil {
 		logrus.WithError(err).Error("failed to get user from database after validating user session")
 		return nil, ErrFailedToResetPasswordBadToken
@@ -210,7 +292,7 @@ func ResetPassword(ctx context.Context, token, password, confirmPassword string)
 		return nil, ErrPasswordIsSame
 	}
 
-	updatedUser, err := mongod.UpdateUser(ctx, &models.User{
+	updatedUser, err := u.db.UpdateUser(ctx, &models.User{
 		UserId:   user.UserId,
 		Password: utils.HashPassword(password),
 	})
@@ -219,7 +301,7 @@ func ResetPassword(ctx context.Context, token, password, confirmPassword string)
 		return nil, ErrFailedToResetPassword
 	}
 
-	_ = session.DestroySession(token) // Destroy token once the password is reset
+	// _ = u.session.DestroySession(token) // Destroy token once the password is reset
 
 	return updatedUser, nil
 }

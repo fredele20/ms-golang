@@ -68,9 +68,17 @@ func (u User) ValidatePhone() error {
 }
 
 type UserList struct {
-	Data  []*User `json:"data"`
-	Count int64   `json:"count"`
+	Data       []*User `json:"data"`
+	Count      int64   `json:"count"`
+	DataSource Source  `json:"source"`
 }
+
+type Source string
+
+const (
+	Database   Source = "database"
+	RedisStore Source = "cache"
+)
 
 type ListUserFilter struct {
 	// NextCursorId is used to paginate forward

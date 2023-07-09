@@ -10,8 +10,9 @@ import (
 type Secrets struct {
 	DatabaseURL  string `json:"DATABASE_URL"`
 	DatabaseName string `json:"DATABASE_NAME"`
-	Port         string 
+	Port         string
 	JWTSecret    string `json:"JWT_SECRET"`
+	RedisAddress string `json:"REDIS_URL"`
 }
 
 var ss Secrets
@@ -28,6 +29,7 @@ func init() {
 	ss.DatabaseURL = os.Getenv("DATABASE_URL")
 	ss.DatabaseName = os.Getenv("DATABASE_NAME")
 	ss.JWTSecret = os.Getenv("JWT_SECRET")
+	ss.RedisAddress = os.Getenv("REDIS_URL")
 
 	if ss.Port = os.Getenv("PORT"); ss.Port == "" {
 		ss.Port = "80"
